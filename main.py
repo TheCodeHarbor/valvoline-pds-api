@@ -231,6 +231,15 @@ def drive_check():
         )
 
 
+@app.get("/drive/index")
+def drive_index():
+    idx = _load_index()
+    return {
+        "count": len(idx),
+        "items": [{"name": k, "stored_as": v} for k, v in idx.items()]
+    }
+
+
 @app.get("/drive/list")
 def drive_list(folder_id: Optional[str] = None):
     fid = folder_id or os.getenv("DRIVE_FOLDER_ID")
