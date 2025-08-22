@@ -246,13 +246,13 @@ def drive_list(folder_id: Optional[str] = None):
             status_code=500,
             content={"ok": False, "error": str(e), "trace": traceback.format_exc()},
         )
-
+        
 
 @app.post("/drive/sync")
 def drive_sync(
+    request: Request,                 # <-- NOT Optional and no default
     folder_id: Optional[str] = None,
     limit: int = 10,
-    request: Optional[Request] = None,
 ):
     """
     Download a batch of PDFs from Drive, parse once, write parsed JSON,
@@ -265,7 +265,7 @@ def drive_sync(
 
         # Optional basic protection for remote syncs
         token = os.getenv("SYNC_TOKEN")
-        if token and request and request.headers.get("X-Sync-Token") != token:
+        if token and request.headers.get("X-Sync-Token") != token:
             raise HTTPException(403, "Forbidden")
 
         svc = get_drive_service()
