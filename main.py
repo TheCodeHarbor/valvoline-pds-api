@@ -2,6 +2,8 @@
 import os
 import json
 import uuid
+import re
+import unicodedata
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -28,10 +30,67 @@ def _load_index() -> dict:
 
 
 def _save_index_entry(product_name: str, pdf_path: Path) -> None:
-    """Store mapping: human name -> local PDF path (string)."""
+    """Store mapping: name/alias -> local PDF path (string). Multiple keys can point to the same PDF."""
+    if not product_name:
+        return
     idx = _load_index()
     idx[product_name.strip()] = str(pdf_path)
     INDEX_PATH.write_text(json.dumps(idx, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ------------------------- NAME NORMALIZATION -------------------------
+def _norm_name(s: str) -> str:
+    """
+    Normalize product names & filename-like tokens so
+    'SynPower ENV C2 5W-30' == 'synpower env c 2 5w30' == 'EUR_Val_SynENVC2_5W30_MO_EN'
+    """
+    s = (s or "").lower()
+    # strip accents / symbols
+    s = ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+    # drop non-alphanum
+    s = re.sub(r'[^a-z0-9]', '', s)
+    # unify common grade tokens
+    s = s.replace('0w40', '0w40').replace('0w30', '0w30').replace('0w20', '0w20')
+    s = s.replace('5w30', '5w30').replace('5w40', '5w40').replace('5w20', '5w20')
+    s = s.replace('10w40', '10w40').replace('10w30', '10w30').replace('10w50', '10w50')
+    # unify C-class tokens (ENV C 2 -> envc2)
+    s = s.replace('c1', 'c1').replace('c2', 'c2').replace('c3', 'c3').replace('c4', 'c4')
+    return s
+
+
+def _resolve_by_name(name: str) -> Path:
+    """
+    Resolve a user-provided product name or filename to a local PDF path using:
+      - exact normalized match on human name or filename stem
+      - substring fallback on normalized keys
+    Index may contain multiple keys for the same file.
+    """
+    idx = _load_index()
+    if not idx:
+        raise HTTPException(404, "Index is empty; run /drive/sync first")
+
+    # Build normalization map including filename stems as aliases
+    norm_map = {}
+    for k, v in idx.items():
+        try:
+            norm_map[_norm_name(k)] = v
+            stem = Path(v).stem
+            norm_map[_norm_name(stem)] = v
+        except Exception:
+            continue
+
+    q = _norm_name(name)
+
+    # exact normalized
+    if q in norm_map:
+        return Path(norm_map[q])
+
+    # relaxed: substring
+    for nk, v in norm_map.items():
+        if q in nk:
+            return Path(v)
+
+    raise HTTPException(404, f"Could not find a PDF for '{name}'")
 
 
 # ------------------------- REQUEST MODELS -------------------------
@@ -123,8 +182,8 @@ async def answer(req: AnswerReq):
 
     B = extract_pds(str(pB))
 
-    import re
-    norm = lambda s: re.sub(r"\s+", " ", (s or "").strip()).lower()
+    import re as _re
+    norm = lambda s: _re.sub(r"\s+", " ", (s or "").strip()).lower()
     mapB = {norm(p.get("property_name", "")): p for p in B.get("typical_properties", []) or []}
 
     nameA = A.get("product_name_line") or Path(A.get("pdf", "")).name
@@ -193,7 +252,7 @@ def drive_list(folder_id: Optional[str] = None):
 def drive_sync(
     folder_id: Optional[str] = None,
     limit: int = 10,
-    request: Request = None,
+    request: Optional[Request] = None,
 ):
     """
     Download a batch of PDFs from Drive, parse once, write parsed JSON,
@@ -223,9 +282,13 @@ def drive_sync(
                 json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
+            # Primary key: product name from the sheet (fallback to filename stem)
             name = (parsed.get("product_name_line") or local.stem).strip()
             if name:
                 _save_index_entry(name, local)
+
+            # ALSO index by filename stem so exact stems work immediately
+            _save_index_entry(local.stem, local)
 
             results.append({"name": name, "stored_as": str(local)})
 
@@ -245,24 +308,6 @@ def drive_sync(
 
 
 # ------------------------- NAME-BASED LOOKUPS FOR STAMMER -------------------------
-def _resolve_by_name(name: str) -> Path:
-    idx = _load_index()
-    if not idx:
-        raise HTTPException(404, "Index is empty; run /drive/sync first")
-
-    # exact (case-insensitive)
-    lower = {k.lower(): v for k, v in idx.items()}
-    if name.lower() in lower:
-        return Path(lower[name.lower()])
-
-    # fuzzy contains
-    for k, v in idx.items():
-        if name.lower() in k.lower():
-            return Path(v)
-
-    raise HTTPException(404, f"Could not find a PDF for '{name}'")
-
-
 @app.post("/summary/by-name")
 def summary_by_name(req: NameReq):
     pA = _resolve_by_name(req.product_a_name)
@@ -297,8 +342,8 @@ def compare_by_name(req: NameReq):
     A = extract_pds(str(pA))
     B = extract_pds(str(pB))
 
-    import re
-    norm = lambda s: re.sub(r"\s+", " ", (s or "").strip()).lower()
+    import re as _re
+    norm = lambda s: _re.sub(r"\s+", " ", (s or "").strip()).lower()
     mapB = {norm(p.get("property_name", "")): p for p in B.get("typical_properties", []) or []}
 
     nameA = A.get("product_name_line") or pA.name
